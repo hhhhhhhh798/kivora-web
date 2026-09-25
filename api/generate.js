@@ -9,9 +9,12 @@ export default async function handler(req, res) {
         return res.status(400).json({ error: 'الرجاء إدخال الوصف' });
     }
 
+    // التحقق من وجود المفتاح بالاسم الصحيح
     const token = process.env.REPLICATE_API_TOKEN;
     if (!token) {
-        return res.status(500).json({ error: 'لم يتم العثور على REPLICATE_API_TOKEN. يرجى عمل Redeploy على Vercel.' });
+        return res.status(500).json({ 
+            error: 'لم يتم العثور على المفتاح REPLICATE_API_TOKEN. تأكد من تسمية المتغير بهذا الاسم بالضبط في Vercel وتأكيد Redeploy.' 
+        });
     }
 
     try {
@@ -28,12 +31,13 @@ export default async function handler(req, res) {
         if (width > height) aspectRatio = "16:9";
         else if (height > width) aspectRatio = "9:16";
 
+        // إرسال الطلب إلى نموذج FLUX.1 عبر Replicate API
         const response = await fetch("https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions", {
             method: "POST",
             headers: {
-                "Authorization": `Token ${token}`,
+                "Authorization": `Bearer ${token.trim()}`,
                 "Content-Type": "application/json",
-                "Prefer": "wait=8"
+                "Prefer": "wait=10"
             },
             body: JSON.stringify({
                 input: {
@@ -47,8 +51,9 @@ export default async function handler(req, res) {
 
         const data = await response.json();
 
-        if (response.status >= 400 || data.error) {
-            return res.status(response.status).json({ error: data.error || data.detail || "خطأ في المفتاح أو الخدمة" });
+        if (!response.ok || data.error) {
+            const errorDetails = data.error || data.detail || JSON.stringify(data);
+            return res.status(response.status || 500).json({ error: `Replicate Error (${response.status}): ${errorDetails}` });
         }
 
         let outputUrl = null;
@@ -56,15 +61,18 @@ export default async function handler(req, res) {
         if (data.status === "succeeded") {
             outputUrl = Array.isArray(data.output) ? data.output[0] : data.output;
         } else if (data.urls && data.urls.get) {
-            for (let i = 0; i < 5; i++) {
+            // انتظار وتتبع اكتمال الصورة خلال 8 ثوانٍ
+            for (let i = 0; i < 8; i++) {
                 await new Promise(r => setTimeout(r, 1000));
                 const checkRes = await fetch(data.urls.get, {
-                    headers: { "Authorization": `Token ${token}` }
+                    headers: { "Authorization": `Bearer ${token.trim()}` }
                 });
                 const checkData = await checkRes.json();
                 if (checkData.status === "succeeded") {
                     outputUrl = Array.isArray(checkData.output) ? checkData.output[0] : checkData.output;
                     break;
+                } else if (checkData.status === "failed") {
+                    return res.status(500).json({ error: "فشلت معالجة الصورة: " + (checkData.error || "خطأ غير معروف") });
                 }
             }
         }
@@ -76,10 +84,10 @@ export default async function handler(req, res) {
                 image_url: outputUrl
             });
         } else {
-            return res.status(500).json({ error: "تأخر المحرك في الاستجابة، يرجى المحاولة مرة أخرى" });
+            return res.status(500).json({ error: "استغرق التوليد وقتاً أطول من المتوقع، يرجى المحاولة مرة أخرى." });
         }
 
     } catch (error) {
-        return res.status(500).json({ error: "حدث خطأ: " + error.message });
+        return res.status(500).json({ error: "حدث خطأ في الخادم: " + error.message });
     }
 }
