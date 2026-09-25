@@ -12,15 +12,13 @@
             --accent-hover: #4f46e5;
             --text-color: #f3f4f6;
         }
-        * {
-            box-sizing: border-box;
-        }
+        * { box-sizing: border-box; }
         body {
             margin: 0;
             padding: 20px 12px;
             background-color: var(--bg-color);
             color: var(--text-color);
-            font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-family: system-ui, -apple-system, sans-serif;
             display: flex;
             justify-content: center;
             min-height: 100vh;
@@ -40,17 +38,16 @@
             font-size: 2rem;
             margin: 0 0 6px 0;
             color: #ffffff;
-            letter-spacing: 1px;
         }
         p.subtitle {
             text-align: center;
             color: #9ca3af;
             font-size: 0.88rem;
-            margin: 0 0 24px 0;
+            margin: 0 0 20px 0;
         }
         textarea {
             width: 100%;
-            height: 110px;
+            height: 90px;
             background: #0f172a;
             border: 1px solid #334155;
             border-radius: 10px;
@@ -59,14 +56,34 @@
             resize: none;
             font-size: 0.95rem;
             outline: none;
-            transition: border-color 0.2s;
         }
-        textarea:focus {
-            border-color: var(--accent-color);
+        .controls {
+            display: flex;
+            gap: 12px;
+            margin-top: 14px;
+        }
+        .control-group {
+            flex: 1;
+        }
+        label {
+            display: block;
+            font-size: 0.8rem;
+            color: #94a3b8;
+            margin-bottom: 6px;
+        }
+        select {
+            width: 100%;
+            padding: 10px;
+            background: #0f172a;
+            border: 1px solid #334155;
+            color: #fff;
+            border-radius: 8px;
+            outline: none;
+            font-size: 0.88rem;
         }
         button {
             width: 100%;
-            margin-top: 16px;
+            margin-top: 18px;
             padding: 14px;
             background: var(--accent-color);
             color: white;
@@ -75,13 +92,6 @@
             font-weight: bold;
             font-size: 1rem;
             cursor: pointer;
-            transition: background 0.2s, transform 0.1s;
-        }
-        button:hover {
-            background: var(--accent-hover);
-        }
-        button:active {
-            transform: scale(0.99);
         }
         .output-box {
             margin-top: 24px;
@@ -106,9 +116,6 @@
             text-align: center;
             padding: 16px;
         }
-        .error-text {
-            color: #ef4444;
-        }
     </style>
 </head>
 <body>
@@ -117,6 +124,27 @@
         <p class="subtitle">Next-Gen Visual Generation Engine</p>
         
         <textarea id="prompt" placeholder="اكتب وصف الصورة أو المشهد هنا..."></textarea>
+        
+        <div class="controls">
+            <div class="control-group">
+                <label>النمط الفني</label>
+                <select id="style">
+                    <option value="photorealistic">واقعي (Cinematic Photo)</option>
+                    <option value="anime">أنيمي (Anime Style)</option>
+                    <option value="digital-art">رسم رقمي (Digital Art)</option>
+                    <option value="cyberpunk">سايبربانك (Cyberpunk)</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label>الأبعاد</label>
+                <select id="ratio">
+                    <option value="1024x1024">مربع (1:1)</option>
+                    <option value="1280x720">عرضي (16:9)</option>
+                    <option value="720x1280">طولي (9:16)</option>
+                </select>
+            </div>
+        </div>
+
         <button onclick="generateImage()">توليد الإبداع 🚀</button>
 
         <div class="output-box" id="result">
@@ -127,20 +155,24 @@
     <script>
         async function generateImage() {
             const prompt = document.getElementById('prompt').value.trim();
+            const style = document.getElementById('style').value;
+            const ratio = document.getElementById('ratio').value.split('x');
             const resultBox = document.getElementById('result');
             
-            if (!prompt) {
-                alert('يرجى كتابة وصف أولاً');
-                return;
-            }
+            if (!prompt) return alert('يرجى كتابة وصف أولاً');
 
-            resultBox.innerHTML = '<span class="status-text">جاري معالجة الطلب عبر Kivora Core Engine...</span>';
+            resultBox.innerHTML = '<span class="status-text">جاري معالجة الطلب عبر Kivora Engine...</span>';
 
             try {
                 const response = await fetch('/api/generate', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ prompt: prompt })
+                    body: JSON.stringify({ 
+                        prompt: prompt,
+                        style: style,
+                        width: parseInt(ratio[0]),
+                        height: parseInt(ratio[1])
+                    })
                 });
 
                 const data = await response.json();
@@ -151,14 +183,11 @@
                     img.onload = () => {
                         resultBox.innerHTML = `<img src="${data.image_url}" alt="Kivora Output">`;
                     };
-                    img.onerror = () => {
-                        resultBox.innerHTML = '<span class="status-text error-text">تعذر تحميل الصورة المولدة.</span>';
-                    };
                 } else {
-                    resultBox.innerHTML = `<span class="status-text error-text">${data.error || 'حدث خطأ أثناء توليد الصورة.'}</span>`;
+                    resultBox.innerHTML = '<span class="status-text" style="color:#ef4444;">حدث خطأ أثناء التوليد.</span>';
                 }
             } catch (err) {
-                resultBox.innerHTML = '<span class="status-text error-text">فشل الاتصال بـ Kivora API.</span>';
+                resultBox.innerHTML = '<span class="status-text" style="color:#ef4444;">فشل الاتصال بـ Kivora API.</span>';
             }
         }
     </script>
