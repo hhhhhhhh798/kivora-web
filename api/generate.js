@@ -1,22 +1,17 @@
 // Kivora — Image Generation Endpoint
 //
-// Two tiers, same contract to the front-end (always returns { success, image_url, provider }):
+// Only providers that need a secret credential or an async workflow go through this
+// function: Nanobanana (needs a key we must not expose to the browser) and AI Horde
+// (needs submit-then-poll). FLUX and Turbo are anonymous and public, so the front-end
+// calls image.pollinations.ai directly — one less network hop, one less thing that can
+// break here.
 //
-// 1) No setup (default): anonymous FLUX.1 [schnell] via image.pollinations.ai.
-//    Free, no signup — but this is the *distilled, speed-optimized* FLUX variant, so short
-//    prompts ("Cat") can come out soft/generic. It also carries a pollinations.ai watermark
-//    on anonymous requests (nologo requires a verified domain — see STYLE_GUIDE.md).
-//
-// 2) With a free key (recommended): once POLLINATIONS_API_KEY is set as an environment
-//    variable on Vercel, this switches to `nanobanana` (Gemini 3.1 Flash Image) on
-//    Pollinations' "seed" tier — still $0, but noticeably sharper and no watermark.
-//    Get a free key at https://enter.pollinations.ai — a "publishable" key is enough,
-//    since this call happens server-side in this function either way.
-//
-// The image is fetched here (server-side) and returned as a data URL, so the front-end
-// never needs to know which tier served it. Vercel's default function timeout (300s on
-// Hobby) comfortably covers generation time, so there's no risk of the request being cut
-// off mid-render.
+// Every failure below is returned with its real cause (HTTP status + upstream message).
+// Nothing is caught and silently swapped for a generic "try again" string, and nothing
+// silently falls back to a different provider without saying so — if you picked a
+// provider and it failed, you get told exactly why, in the response and in this
+// function's server logs (Vercel dashboard → your project → Deployments → open the
+// latest one → Functions/Logs tab).
 
 const STYLE_MODIFIERS = {
   'photorealistic': 'hyperrealistic photograph, natural light, 35mm film, fine detail',
@@ -27,7 +22,9 @@ const STYLE_MODIFIERS = {
 
 const MAX_DIMENSION = 1440;
 const MIN_DIMENSION = 256;
-const FETCH_TIMEOUT_MS = 55_000;
+const HORDE_POLL_BUDGET_MS = 100_000;
+const HORDE_POLL_INTERVAL_MS = 3_000;
+const CLIENT_AGENT = 'Kivora:1.0:kivora-project';
 
 function clamp(value, fallback) {
   const n = parseInt(value, 10);
@@ -35,20 +32,139 @@ function clamp(value, fallback) {
   return Math.min(MAX_DIMENSION, Math.max(MIN_DIMENSION, n));
 }
 
-async function fetchWithTimeout(url, ms) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ms);
-  try {
-    return await fetch(url, { signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
+function snapTo64(n) {
+  return Math.max(64, Math.round(n / 64) * 64);
 }
 
 async function toDataUrl(response) {
   const contentType = response.headers.get('content-type') || 'image/jpeg';
   const buffer = Buffer.from(await response.arrayBuffer());
   return `data:${contentType};base64,${buffer.toString('base64')}`;
+}
+
+async function safeErrorBody(response) {
+  try {
+    const text = await response.text();
+    return text.slice(0, 300);
+  } catch {
+    return '';
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// --- Nanobanana (Gemini 3.1 Flash Image, Pollinations "seed" tier) ---
+async function generateNanobanana({ encodedPrompt, width, height, seed }) {
+  const apiKey = process.env.POLLINATIONS_API_KEY;
+  if (!apiKey) {
+    const err = new Error(
+      'لسا ما في مفتاح Nanobanana معرّف على السيرفر. أضف متغير البيئة POLLINATIONS_API_KEY ' +
+      'من Vercel → Settings → Environment Variables (المفتاح من enter.pollinations.ai)، وبعدها اعمل Redeploy.'
+    );
+    err.status = 400;
+    throw err;
+  }
+
+  const url =
+    `https://gen.pollinations.ai/image/${encodedPrompt}` +
+    `?key=${encodeURIComponent(apiKey)}&model=nanobanana&width=${width}&height=${height}&seed=${seed}`;
+
+  const response = await fetch(url);
+  if (!response.ok) {
+    const body = await safeErrorBody(response);
+    const err = new Error(`Nanobanana رجّع خطأ (HTTP ${response.status}): ${body || 'بدون تفاصيل إضافية'}`);
+    err.status = 502;
+    throw err;
+  }
+  const image_url = await toDataUrl(response);
+  return { image_url, provider: 'Kivora Engine · Nanobanana (Gemini 3.1 Flash Image)', model: 'nanobanana' };
+}
+
+// --- AI Horde (crowdsourced, open-source Stable Diffusion models, no signup required) ---
+async function generateHorde({ prompt, width, height }) {
+  const apiKey = process.env.AIHORDE_API_KEY || '0000000000'; // anonymous tier if not set
+  const w = snapTo64(width);
+  const h = snapTo64(height);
+
+  const submitRes = await fetch('https://aihorde.net/api/v2/generate/async', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'apikey': apiKey,
+      'Client-Agent': CLIENT_AGENT,
+    },
+    body: JSON.stringify({
+      prompt,
+      params: {
+        width: w,
+        height: h,
+        steps: 22,
+        cfg_scale: 7,
+        sampler_name: 'k_euler_a',
+        karras: true,
+        n: 1,
+      },
+      r2: true,
+      nsfw: false,
+    }),
+  });
+
+  if (!submitRes.ok) {
+    const body = await safeErrorBody(submitRes);
+    const err = new Error(`AI Horde رفض الطلب (HTTP ${submitRes.status}): ${body || 'بدون تفاصيل إضافية'}`);
+    err.status = 502;
+    throw err;
+  }
+  const { id, message } = await submitRes.json();
+  if (!id) {
+    const err = new Error(`AI Horde ما رجّع رقم طلب (id). الرسالة: ${message || 'غير معروفة'}`);
+    err.status = 502;
+    throw err;
+  }
+
+  const deadline = Date.now() + HORDE_POLL_BUDGET_MS;
+  while (Date.now() < deadline) {
+    await sleep(HORDE_POLL_INTERVAL_MS);
+    const checkRes = await fetch(`https://aihorde.net/api/v2/generate/check/${id}`, {
+      headers: { 'Client-Agent': CLIENT_AGENT },
+    });
+    if (!checkRes.ok) continue; // transient — keep polling until the deadline
+    const check = await checkRes.json();
+    if (check.faulted) {
+      const err = new Error('الموديل يلي اختاره الطابور توقف أثناء الرسم (faulted). جرب مرة ثانية.');
+      err.status = 502;
+      throw err;
+    }
+    if (check.done) {
+      const statusRes = await fetch(`https://aihorde.net/api/v2/generate/status/${id}`, {
+        headers: { 'Client-Agent': CLIENT_AGENT },
+      });
+      if (!statusRes.ok) {
+        const body = await safeErrorBody(statusRes);
+        const err = new Error(`تعذّر جلب نتيجة AI Horde (HTTP ${statusRes.status}): ${body || ''}`);
+        err.status = 502;
+        throw err;
+      }
+      const status = await statusRes.json();
+      const gen = status.generations && status.generations[0];
+      if (!gen || !gen.img) {
+        const err = new Error('AI Horde قال إنه خلص، بس ما رجّع صورة.');
+        err.status = 502;
+        throw err;
+      }
+      return {
+        image_url: gen.img,
+        provider: `Kivora Engine · AI Horde (${gen.model || 'Stable Diffusion مجتمعي'})`,
+        model: gen.model || 'unknown',
+      };
+    }
+  }
+
+  const err = new Error('الطابور المجتمعي مزدحم وما خلص خلال الوقت المسموح. جرب مرة ثانية بعد شوي.');
+  err.status = 504;
+  throw err;
 }
 
 export default async function handler(req, res) {
@@ -58,6 +174,7 @@ export default async function handler(req, res) {
 
   const body = req.body || {};
   const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+  const provider = body.provider === 'horde' ? 'horde' : 'nanobanana';
   const style = STYLE_MODIFIERS[body.style] ? body.style : 'photorealistic';
 
   if (!prompt) {
@@ -72,48 +189,15 @@ export default async function handler(req, res) {
   const seed = Math.floor(Math.random() * 10_000_000);
   const enhancedPrompt = `${prompt}, ${STYLE_MODIFIERS[style]}`;
   const encodedPrompt = encodeURIComponent(enhancedPrompt);
-  const apiKey = process.env.POLLINATIONS_API_KEY;
 
-  // Tier 1: Nanobanana (Gemini 3.1 Flash Image) — only if a free key is configured.
-  if (apiKey) {
-    try {
-      const url =
-        `https://gen.pollinations.ai/image/${encodedPrompt}` +
-        `?key=${encodeURIComponent(apiKey)}&model=nanobanana&width=${width}&height=${height}&seed=${seed}`;
-      const response = await fetchWithTimeout(url, FETCH_TIMEOUT_MS);
-      if (response.ok) {
-        const image_url = await toDataUrl(response);
-        return res.status(200).json({
-          success: true,
-          provider: 'Kivora Engine · Nanobanana (Gemini 3.1 Flash Image)',
-          seed, width, height,
-          image_url,
-        });
-      }
-      // fall through to the anonymous tier below on any non-OK response
-    } catch (err) {
-      // fall through to the anonymous tier below on timeout/network error
-    }
-  }
-
-  // Tier 2 (default / fallback): anonymous FLUX.1 [schnell], enhance=true asks
-  // Pollinations' own AI to flesh out short prompts before generating.
   try {
-    const url =
-      `https://image.pollinations.ai/prompt/${encodedPrompt}` +
-      `?width=${width}&height=${height}&seed=${seed}&model=flux&nologo=true&enhance=true&referrer=kivora`;
-    const response = await fetchWithTimeout(url, FETCH_TIMEOUT_MS);
-    if (!response.ok) {
-      return res.status(502).json({ error: 'محرك التوليد ما رجّع صورة. حاول مرة ثانية.' });
-    }
-    const image_url = await toDataUrl(response);
-    return res.status(200).json({
-      success: true,
-      provider: 'Kivora Engine · FLUX.1 [schnell] (Apache 2.0)',
-      seed, width, height,
-      image_url,
-    });
+    const result = provider === 'horde'
+      ? await generateHorde({ prompt: enhancedPrompt, width, height })
+      : await generateNanobanana({ encodedPrompt, width, height, seed });
+
+    return res.status(200).json({ success: true, seed, width, height, ...result });
   } catch (err) {
-    return res.status(504).json({ error: 'المحرك طوّل بالرد أكثر من اللازم. حاول مرة ثانية.' });
+    console.error(`[kivora/generate] provider=${provider}`, err);
+    return res.status(err.status || 500).json({ error: err.message || 'صار خطأ غير متوقع.' });
   }
 }
