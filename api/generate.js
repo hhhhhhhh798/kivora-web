@@ -8,10 +8,9 @@
 //
 // Every failure below is returned with its real cause (HTTP status + upstream message).
 // Nothing is caught and silently swapped for a generic "try again" string, and nothing
-// silently falls back to a different provider without saying so — if you picked a
-// provider and it failed, you get told exactly why, in the response and in this
-// function's server logs (Vercel dashboard → your project → Deployments → open the
-// latest one → Functions/Logs tab).
+// silently falls back to a different PROVIDER without saying so. The one exception is AI
+// Horde's own resolution auto-clamp below, which stays within AI Horde and always reports
+// that it happened — see the "KudosUpfront" handling.
 
 const STYLE_MODIFIERS = {
   'photorealistic': 'hyperrealistic photograph, natural light, 35mm film, fine detail',
@@ -32,22 +31,17 @@ function clamp(value, fallback) {
   return Math.min(MAX_DIMENSION, Math.max(MIN_DIMENSION, n));
 }
 
-function snapTo64(n) {
-  return Math.max(64, Math.round(n / 64) * 64);
-}
-
 async function toDataUrl(response) {
   const contentType = response.headers.get('content-type') || 'image/jpeg';
   const buffer = Buffer.from(await response.arrayBuffer());
   return `data:${contentType};base64,${buffer.toString('base64')}`;
 }
 
-async function safeErrorBody(response) {
+async function safeErrorJson(response) {
   try {
-    const text = await response.text();
-    return text.slice(0, 300);
+    return await response.json();
   } catch {
-    return '';
+    return null;
   }
 }
 
@@ -55,13 +49,13 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// --- Nanobanana (Gemini 3.1 Flash Image, Pollinations "seed" tier) ---
+// --- Nanobanana (Gemini 3.1 Flash Image, Pollinations "seed"/free tier) ---
 async function generateNanobanana({ encodedPrompt, width, height, seed }) {
   const apiKey = process.env.POLLINATIONS_API_KEY;
   if (!apiKey) {
     const err = new Error(
       'لسا ما في مفتاح Nanobanana معرّف على السيرفر. أضف متغير البيئة POLLINATIONS_API_KEY ' +
-      'من Vercel → Settings → Environment Variables (المفتاح من enter.pollinations.ai)، وبعدها اعمل Redeploy.'
+      'من Vercel → Settings → Environment Variables، وبعدها اعمل Redeploy.'
     );
     err.status = 400;
     throw err;
@@ -73,8 +67,15 @@ async function generateNanobanana({ encodedPrompt, width, height, seed }) {
 
   const response = await fetch(url);
   if (!response.ok) {
-    const body = await safeErrorBody(response);
-    const err = new Error(`Nanobanana رجّع خطأ (HTTP ${response.status}): ${body || 'بدون تفاصيل إضافية'}`);
+    const data = await safeErrorJson(response);
+    let hint = data?.message || 'بدون تفاصيل إضافية';
+    if (response.status === 402) {
+      hint +=
+        ' — إذا مفتاحك يبلش بـ sk_ (Secret) هذا هو السبب: النوع هذا بيسحب من رصيد مدفوع فقط. ' +
+        'بدّله لمفتاح Publishable (يبلش بـ pk_) من enter.pollinations.ai — هذا النوع وحده ' +
+        'إله رصيد مجاني (١ Pollen بالساعة) يكفي توليد الصور بسهولة.';
+    }
+    const err = new Error(`Nanobanana رجّع خطأ (HTTP ${response.status}): ${hint}`);
     err.status = 502;
     throw err;
   }
@@ -83,12 +84,22 @@ async function generateNanobanana({ encodedPrompt, width, height, seed }) {
 }
 
 // --- AI Horde (crowdsourced, open-source Stable Diffusion models, no signup required) ---
-async function generateHorde({ prompt, width, height }) {
-  const apiKey = process.env.AIHORDE_API_KEY || '0000000000'; // anonymous tier if not set
-  const w = snapTo64(width);
-  const h = snapTo64(height);
+//
+// The anonymous/low-kudos tier can only request resolutions AI Horde currently classifies
+// as "free" (this threshold moves with server load; ~576x576 is documented as always free).
+// Anything above that demands "upfront kudos" the anonymous key doesn't have, and the
+// request is rejected with HTTP 403 / rc "KudosUpfront". So: start conservative, and if we
+// still get that specific error, retry once at an even smaller size before giving up.
 
-  const submitRes = await fetch('https://aihorde.net/api/v2/generate/async', {
+function hordeDimsForShape(width, height) {
+  const ratio = width / height;
+  if (ratio > 1.2) return { w: 640, h: 384 };   // wide
+  if (ratio < 0.85) return { w: 384, h: 640 };  // tall
+  return { w: 576, h: 576 };                    // square
+}
+
+async function submitHordeJob(prompt, dims, steps, apiKey) {
+  return fetch('https://aihorde.net/api/v2/generate/async', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -98,9 +109,9 @@ async function generateHorde({ prompt, width, height }) {
     body: JSON.stringify({
       prompt,
       params: {
-        width: w,
-        height: h,
-        steps: 22,
+        width: dims.w,
+        height: dims.h,
+        steps,
         cfg_scale: 7,
         sampler_name: 'k_euler_a',
         karras: true,
@@ -110,10 +121,31 @@ async function generateHorde({ prompt, width, height }) {
       nsfw: false,
     }),
   });
+}
+
+async function generateHorde({ prompt, width, height }) {
+  const apiKey = process.env.AIHORDE_API_KEY || '0000000000'; // anonymous tier if not set
+  let dims = hordeDimsForShape(width, height);
+  let steps = 20;
+  let resizedNotice = '';
+
+  let submitRes = await submitHordeJob(prompt, dims, steps, apiKey);
+
+  if (submitRes.status === 403) {
+    const data = await safeErrorJson(submitRes);
+    if (data?.rc === 'KudosUpfront') {
+      // Retry once, smaller — AI Horde's free threshold moves with load, so even our
+      // conservative default can occasionally get rejected during a busy stretch.
+      dims = { w: 512, h: 512 };
+      steps = 16;
+      resizedNotice = ' (تم تصغير الأبعاد تلقائياً لأنه الطابور مزدحم هلق)';
+      submitRes = await submitHordeJob(prompt, dims, steps, apiKey);
+    }
+  }
 
   if (!submitRes.ok) {
-    const body = await safeErrorBody(submitRes);
-    const err = new Error(`AI Horde رفض الطلب (HTTP ${submitRes.status}): ${body || 'بدون تفاصيل إضافية'}`);
+    const data = await safeErrorJson(submitRes);
+    const err = new Error(`AI Horde رفض الطلب (HTTP ${submitRes.status}): ${data?.message || 'بدون تفاصيل إضافية'}`);
     err.status = 502;
     throw err;
   }
@@ -142,8 +174,8 @@ async function generateHorde({ prompt, width, height }) {
         headers: { 'Client-Agent': CLIENT_AGENT },
       });
       if (!statusRes.ok) {
-        const body = await safeErrorBody(statusRes);
-        const err = new Error(`تعذّر جلب نتيجة AI Horde (HTTP ${statusRes.status}): ${body || ''}`);
+        const data = await safeErrorJson(statusRes);
+        const err = new Error(`تعذّر جلب نتيجة AI Horde (HTTP ${statusRes.status}): ${data?.message || ''}`);
         err.status = 502;
         throw err;
       }
@@ -156,7 +188,7 @@ async function generateHorde({ prompt, width, height }) {
       }
       return {
         image_url: gen.img,
-        provider: `Kivora Engine · AI Horde (${gen.model || 'Stable Diffusion مجتمعي'})`,
+        provider: `Kivora Engine · AI Horde (${gen.model || 'Stable Diffusion مجتمعي'})${resizedNotice}`,
         model: gen.model || 'unknown',
       };
     }
